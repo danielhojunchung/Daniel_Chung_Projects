@@ -1,0 +1,208 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import FastICA
+import cv2
+import requests
+from io import BytesIO
+import random
+import pandas as pd
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+from scipy.optimize import minimize
+from sklearn.decomposition import FastICA
+import warnings
+import cvxpy as cp
+from scipy.optimize import linprog
+from sklearn.decomposition import FactorAnalysis
+import time
+from sklearn.cross_decomposition import CCA as Canon
+
+class Solutions:
+  @staticmethod
+  def normal_scale(arr):
+    col_sums = np.sum(arr, axis=0)  # Compute column sums
+    max_col_index = np.argmax(np.abs(col_sums))  # Index of max absolute column sum
+    max_col_sum = col_sums[max_col_index]
+    if max_col_sum == 0:
+        return arr  # Avoid division by zero if all elements are zero    
+
+    scaling_factor = 1 / max_col_sum  # Compute the scaling factor
+    return arr * scaling_factor
+
+  @staticmethod
+  def heuristic_solution(arr, max_col):
+    epsilon = 1e-8
+
+    # Compute the scaling factors for each row
+    scales = arr[:, max_col] / (np.sum(np.abs(arr), axis=1) - np.abs(arr[:, max_col]) + epsilon)
+
+    # Apply row scaling
+    arr_scaled = (arr.T * scales).T
+
+    return Solutions.normal_scale(arr_scaled)
+
+  @staticmethod
+  def linear_solution(arr, max_col):
+
+    m, n = arr.shape  # Matrix dimensions
+
+    # Objective: Maximize sum of the selected column
+    c = -arr[:, max_col]  # Negative because linprog minimizes by default
+
+    A_ineq = []
+    b_ineq = []
+
+    for k in range(n):
+      if k != max_col:
+        A_ineq.append(arr[:, k])   # Positive constraint
+        A_ineq.append(-arr[:, k])  # Negative constraint
+        b_ineq.append(1)  # Upper bound for constraint
+        b_ineq.append(1)
+
+    A_ineq = np.array(A_ineq)
+    b_ineq = np.array(b_ineq)
+
+    # Bounds: Allow weights to range from -2 to 2
+    bounds = [(-1, 1) for _ in range(m)]
+
+    # Solve LP
+    result = linprog(c, A_ub=A_ineq, b_ub=b_ineq, bounds=bounds, method="highs")
+
+    scaling_factors = result.x
+    arr_scaled = (arr.T * scaling_factors).T
+    return Solutions.normal_scale(arr_scaled)
+
+  @staticmethod
+  def quadratic_solution(arr, max_col):
+    n, m = arr.shape  # Matrix dimensions
+
+    # Define optimization variable (weights vector)
+    w = cp.Variable(n)
+
+    # Compute numerator: (sum of selected column weighted)²
+    selected_col_sum = cp.sum(cp.multiply(w, arr[:, max_col]))
+    maximize_term = cp.square(selected_col_sum)
+
+    remaining_cols = [i for i in range(m) if i != max_col]
+    penalty_term = cp.sum([cp.square(cp.sum(cp.multiply(w, arr[:, col]))) for col in remaining_cols])
+
+    # Define objective: Maximize selected column minus lambda times penalty term
+    objective = cp.Maximize(selected_col_sum - penalty_term)
+
+    # Constraints: Weights sum to 1, and values remain within a reasonable range
+    constraints = [w >= -1, w <= 1]
+
+    # Solve the optimization problem
+    problem = cp.Problem(objective, constraints)
+    problem.solve(solver=cp.SCS)
+
+    arr_scaled = (arr.T * w.value).T
+    return Solutions.normal_scale(arr_scaled)
+
+  @staticmethod
+  def gradient_solution(arr, max_col):
+    n, m = arr.shape  # Matrix dimensions
+
+    # Objective function to maximize the squared sum of the target column while minimizing other columns
+    def objective(w):
+        selected_col_sum = np.sum(w * arr[:, max_col])  # Weighted sum of the selected column
+        maximize_term = selected_col_sum**2  # Square of the sum
+
+        remaining_cols = [i for i in range(m) if i != max_col]
+        minimize_term = np.sum([np.sum(w * arr[:, col])**2 for col in remaining_cols])  # Sum of squares
+
+        return (minimize_term / maximize_term)  # Negative for minimization
+
+    # Initial guess for weights (equal distribution)
+    w0 = np.ones(n) / n
+
+    # Constraints: Sum of weights must equal 1
+    #constraints = {'type': 'eq', 'fun': lambda w: np.sum(w) - 1}
+
+    # Bounds for weights (allowing both positive and negative values for flexibility)
+    bounds = [(-1, 1) for _ in range(n)]
+
+    # Solve the optimization problem using Sequential Least Squares Programming (SLSQP)
+    result = minimize(objective, w0, bounds=bounds, method="SLSQP")
+
+    # Apply optimized weights to A and return the transformed matrix
+    arr_scaled = (arr.T * result.x).T
+    return Solutions.normal_scale(arr_scaled)
+
+class Fit:
+  @staticmethod
+  def pca(arr, n_components):
+    pca = PCA(n_components = n_components)  # Ensure it keeps all dimensions
+    pca.fit(arr)
+    return pca.components_
+
+  @staticmethod
+  def fa(arr, n_components):
+    fa = FactorAnalysis(n_components)
+    fa.fit(arr)
+    return fa.components_
+
+  @staticmethod
+  def ica(arr, n_components):
+    ica = FastICA(n_components)
+    ica.fit(arr)
+    return ica.components_
+
+class CCA:
+  def __init__(self, n_components, max_cols=None, fit_solution="heuristic", fit_method = "pca"):
+    self.n_components = n_components
+    self.max_cols = max_cols if max_cols is not None else range(0, n_components)
+    self.fit_solution = fit_solution
+    self.fit_method = fit_method
+    self.mean = None
+    self.components = None 
+    self.optimized = []
+
+  def fit(self, X, y=None):
+
+    self.mean = np.mean(X, axis=0)
+    X_centered = X - self.mean
+
+    if (self.fit_method == "pca"):
+      self.components = Fit.pca(X, self.n_components)
+    elif (self.fit_method == "fa"):
+      self.components = Fit.fa(X, self.n_components)
+    elif (self.fit_method == "ica"):
+      self.components = Fit.ica(X, self.n_components)
+    else:
+      warnings.warn("Warning: 'fit_method' was not specified, defaulting to pca (eigenvalue).", UserWarning)
+
+    if (self.fit_solution == "heuristic"):
+      for col in self.max_cols:
+        self.optimized.append(Solutions.heuristic_solution(self.components, col).T[:, col])
+    elif (self.fit_solution == "linear"):
+      for col in self.max_cols:
+        self.optimized.append(Solutions.linear_solution(self.components, col).T[:, col])
+    elif (self.fit_solution == "quadratic"):
+      for col in self.max_cols:
+        self.optimized.append(Solutions.quadratic_solution(self.components, col).T[:, col])
+    elif (self.fit_solution == "gradient"):
+      for col in self.max_cols:
+        self.optimized.append(Solutions.gradient_solution(self.components, col).T[:, col])
+    else:
+      warnings.warn("Warning: 'fit_solution' was not specified, defaulting to heuristic          .", UserWarning)
+      for col in self.max_cols:
+        self.optimized.append(Solutions.heuristic_solution(self.components, col).T[:, col])
+
+    self.optimized = np.column_stack(self.optimized)
+
+    return self
+
+  def transform(self, X, y=None):
+    X_centered = X - self.mean
+    transformed = np.zeros((X_centered.shape[0], self.n_components))
+    print(X_centered.shape, self.optimized.shape)
+    for col in self.max_cols:
+      transformed[:, col] = X_centered @ self.optimized[:, col]
+
+    
+    return transformed
+
+  def fit_transform(self, X, y=None):
+    self.fit(X, y)
+    return self.transform(X)
